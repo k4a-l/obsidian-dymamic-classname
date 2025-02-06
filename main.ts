@@ -1,111 +1,193 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+	App,
+	EventRef,
+	FrontMatterCache,
+	MarkdownView,
+	Notice,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	TAbstractFile,
+} from "obsidian";
 
-// Remember to rename these classes and interfaces!
+type OrArray<T> = T | T[];
 
 interface MyPluginSettings {
-	mySetting: string;
+	tags: string[];
+	paths: string[];
+	titles: string[];
+	frontmatter: Record<string, OrArray<string | number | boolean>>;
+	className: string;
 }
 
 const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+	tags: ["private"],
+	paths: ["private"],
+	titles: ["🔐"],
+	frontmatter: { publish: ["false"] },
+	className: "dynamic-classname",
+};
 
 export default class MyPlugin extends Plugin {
 	settings: MyPluginSettings;
 
+	private eventRefs: EventRef[];
+
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SampleSettingTab(this.app, this));
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		this.eventRefs = [
+			this.app.workspace.on("file-open", () => {
+				this.exec();
+			}),
+			this.app.metadataCache.on("resolve", () => {
+				this.exec();
+			}),
+			this.app.vault.on("rename", (f) => {
+				this.exec(f);
+			}),
+		];
 	}
-
 	onunload() {
-
+		this.eventRefs.forEach((ref) => this.app.metadataCache.offref(ref));
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			await this.loadData()
+		);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	private exec(tAbstractFile?: TAbstractFile) {
+		const markdownView =
+			this.app.workspace.getActiveViewOfType(MarkdownView);
+
+		const activeFile = markdownView?.file;
+		const activeFileCache = activeFile
+			? this.app.metadataCache.getFileCache(activeFile)
+			: undefined;
+
+		const title = activeFile?.basename ?? tAbstractFile?.name;
+		const path = activeFile?.path ?? tAbstractFile?.path;
+
+		if (!title || !path) return;
+
+		const tags = activeFileCache
+			? activeFileCache.tags?.map((t) => t.tag.replace("#", "")) ?? []
+			: [];
+		const frontmatter = activeFileCache
+			? activeFileCache.frontmatter
+			: undefined;
+
+		const el = markdownView?.contentEl
+			? [markdownView.contentEl]
+			: this.app.workspace
+					.getLeavesOfType("markdown")
+					.map((l) =>
+						"containerEl" in l
+							? (l.containerEl as HTMLElement)
+							: undefined
+					)
+					.map((el) => el?.querySelector("div.view-content"))
+					.flatMap((el) => el ?? []);
+		// todo: もう少し安全なアクセス方法があるはず
+		// tAbstractFileを使うのはrenameのとき
+		//  ファイルを直接renameするときは普通にfileがつかえる
+		//  エクスプローラーから移動するときはactiveFileがないのでtAbstractFileを使わないといけない
+
+		const isMatched = this.isPrivate({
+			tags,
+			path,
+			title,
+			frontmatter: frontmatter ?? {},
+		});
+
+		if (isMatched) {
+			el.forEach((el) => el.classList.add(this.settings.className));
+		} else {
+			el.forEach((el) => el.classList.remove(this.settings.className));
+		}
+	}
+
+	private isPrivate = ({
+		tags,
+		path,
+		title,
+		frontmatter,
+	}: {
+		tags: string[];
+		path: string;
+		title: string;
+		frontmatter: FrontMatterCache;
+	}): boolean => {
+		if (tags.some((tag) => this.settings.tags.includes(tag))) {
+			logging("tag matched");
+			return true;
+		}
+		if (this.settings.paths.some((p) => path.startsWith(p))) {
+			logging("path matched");
+			return true;
+		}
+		if (this.settings.titles.some((t) => title.includes(t))) {
+			logging("title matched");
+			return true;
+		}
+
+		type SingleValue = string | number | boolean;
+		const isSingleValue = (v: unknown): v is SingleValue =>
+			typeof v === "string" ||
+			typeof v === "number" ||
+			typeof v === "boolean";
+
+		const isMatch = (v1: SingleValue, v2: SingleValue) => {
+			return v1.toString() === v2.toString();
+		};
+
+		if (
+			Object.entries(this.settings.frontmatter).some(([sKey, sValue]) => {
+				const fValue = frontmatter[sKey];
+				if (isSingleValue(sValue)) {
+					if (isSingleValue(fValue)) {
+						return isMatch(sValue, fValue);
+					} else if (Array.isArray(fValue)) {
+						return fValue.some((v) => isMatch(sValue, v));
+					}
+				} else if (Array.isArray(sValue)) {
+					if (isSingleValue(fValue)) {
+						return sValue.some((v) => isMatch(v, fValue));
+					} else if (Array.isArray(fValue)) {
+						return sValue.some((v) =>
+							fValue.some((f) => isMatch(v, f))
+						);
+					}
+				}
+			})
+		) {
+			return true;
+		}
+
+		logging("no matched", {
+			title,
+			f: this.settings.titles,
+		});
+
+		return false;
+	};
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+const isProduction = process.env.NODE_ENV === "production";
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
+const logging: typeof console.log = (...args) => {
+	!isProduction && console.log(...args);
+};
 
 class SampleSettingTab extends PluginSettingTab {
 	plugin: MyPlugin;
@@ -116,19 +198,84 @@ class SampleSettingTab extends PluginSettingTab {
 	}
 
 	display(): void {
-		const {containerEl} = this;
+		const { containerEl } = this;
 
 		containerEl.empty();
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+		new Setting(containerEl).infoEl.setText("");
+
+		new Setting(containerEl).setName("tags").addTextArea((text) =>
+			text
+				.setValue(this.plugin.settings.tags.join("\n"))
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.tags = value
+						.split("\n")
+						.filter((v) => v);
 					await this.plugin.saveSettings();
-				}));
+				})
+		);
+
+		new Setting(containerEl)
+			.setName("paths")
+			.setDesc("startsWith match")
+			.addTextArea((text) =>
+				text
+					.setValue(this.plugin.settings.paths.join("\n"))
+					.onChange(async (value) => {
+						this.plugin.settings.paths = value
+							.split("\n")
+							.filter((v) => v);
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("titles")
+			.setDesc("includes match")
+			.addTextArea((text) =>
+				text
+					.setValue(this.plugin.settings.titles.join("\n"))
+					.onChange(async (value) => {
+						this.plugin.settings.titles = value
+							.split("\n")
+							.filter((v) => v);
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("frontmatter")
+			.setDesc(
+				String.raw`input format: Record<string,string | string[]>. 
+                example:
+                    {
+                        "publish": 'false'
+                        "tags": ['tag1', 'tag2']
+                    }  
+                `
+			)
+			.addTextArea((text) =>
+				text
+					.setValue(JSON.stringify(this.plugin.settings.frontmatter))
+					.onChange(async (value) => {
+						try {
+							this.plugin.settings.frontmatter =
+								JSON.parse(value);
+							await this.plugin.saveSettings();
+						} catch (error) {
+							console.error(error);
+							new Notice(`frontmatter is Invalid JSON`);
+						}
+					})
+			);
+
+		new Setting(containerEl).setName("className").addText((text) =>
+			text
+				.setValue(this.plugin.settings.className)
+				.onChange(async (value) => {
+					this.plugin.settings.className = value.trim();
+					await this.plugin.saveSettings();
+				})
+		);
 	}
 }
